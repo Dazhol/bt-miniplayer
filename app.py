@@ -1,6 +1,9 @@
+import atexit
 import json
 import os
 import re
+import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -351,6 +354,7 @@ class WinRTBridge:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._proc: subprocess.Popen | None = None
+        self.audio_connected = False
         self._start_process()
 
     def _start_process(self) -> None:
@@ -395,6 +399,12 @@ class WinRTBridge:
                         data["devices"] = []
                     elif isinstance(devs, dict):
                         data["devices"] = [devs]
+                if "audioConnected" in data:
+                    self.audio_connected = bool(data.get("audioConnected"))
+                elif payload.get("action") == "disconnect":
+                    self.audio_connected = False
+                elif payload.get("action") == "connect" and data.get("ok"):
+                    self.audio_connected = True
                 return data
             except Exception as exc:
                 return {"ok": False, "error": str(exc)}
@@ -405,9 +415,14 @@ class WinRTBridge:
                 try:
                     self._proc.stdin.write(json.dumps({"action": "disconnect"}) + "\n")
                     self._proc.stdin.flush()
+                    self._proc.stdout.readline()
                 except Exception:
                     pass
-                self._proc.terminate()
+                try:
+                    self._proc.terminate()
+                except Exception:
+                    pass
+                self.audio_connected = False
 
 
 HTML_PAGE = """<!DOCTYPE html>
@@ -1017,6 +1032,11 @@ HTML_PAGE = """<!DOCTYPE html>
         <input id="pausePhoneCheck" type="checkbox" checked />
       </label>
 
+      <label class="toggle-option" title="Al cerrar esta pestaña o ventana del navegador, desconecta automáticamente el enlace de audio Bluetooth del teléfono para que quede libre.">
+        <span>🔌 Desconectar Bluetooth al cerrar la ventana</span>
+        <input id="disconnectOnCloseCheck" type="checkbox" checked />
+      </label>
+
       <label class="toggle-option">
         <span>🛡️ Silenciar música si hablan en Teams</span>
         <input id="autoDuckCheck" type="checkbox" checked />
@@ -1556,6 +1576,27 @@ HTML_PAGE = """<!DOCTYPE html>
       }
     });
 
+    function handleWindowCloseDisconnect() {
+      const check = document.getElementById("disconnectOnCloseCheck");
+      const shouldDisconnect = check ? check.checked : true;
+      if (!shouldDisconnect || !currentState.audioConnected) return;
+      const data = JSON.stringify({ action: "disconnect" });
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon("/api/command", new Blob([data], { type: "application/json" }));
+      }
+      try {
+        fetch("/api/command", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: data,
+          keepalive: true
+        });
+      } catch (err) {}
+    }
+
+    window.addEventListener("pagehide", handleWindowCloseDisconnect);
+    window.addEventListener("beforeunload", handleWindowCloseDisconnect);
+
     refreshState(true);
     setInterval(() => refreshState(false), 1000);
   </script>
@@ -1566,6 +1607,25 @@ HTML_PAGE = """<!DOCTYPE html>
 
 bridge = WinRTBridge()
 adb_bridge = AdbMediaBridge()
+LAST_CLIENT_HEARTBEAT = time.time()
+
+
+def start_watchdog(bridge_inst: WinRTBridge) -> None:
+    def _loop() -> None:
+        # Período de gracia inicial de 12 segundos para permitir que el navegador abra y cargue
+        time.sleep(12.0)
+        while True:
+            time.sleep(2.0)
+            now = time.time()
+            # Si transcurren más de 5.5s sin peticiones de ninguna pestaña/ventana y el audio está conectado:
+            if (now - LAST_CLIENT_HEARTBEAT) > 5.5:
+                if bridge_inst.audio_connected:
+                    print("\n[Watchdog] No se detecta ventana del navegador activa (sin clientes en 5s).")
+                    print("[Watchdog] Desconectando automáticamente el audio Bluetooth para liberar tu teléfono...")
+                    bridge_inst.send_command({"action": "disconnect"})
+                    bridge_inst.audio_connected = False
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
 
 
 class MiniPlayerHandler(BaseHTTPRequestHandler):
@@ -1587,6 +1647,8 @@ class MiniPlayerHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/command":
+            global LAST_CLIENT_HEARTBEAT
+            LAST_CLIENT_HEARTBEAT = time.time()
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length).decode("utf-8") if length > 0 else "{}"
             try:
@@ -1661,6 +1723,25 @@ def open_miniplayer_window(url: str) -> None:
 
 
 def main() -> None:
+    # Auto-desconectar de forma garantizada si el proceso finaliza o se interrumpe
+    atexit.register(bridge.close)
+
+    def _cleanup_handler(*args):
+        print("\nCerrando aplicación y desconectando Bluetooth...")
+        bridge.close()
+        sys.exit(0)
+
+    try:
+        signal.signal(signal.SIGINT, _cleanup_handler)
+        signal.signal(signal.SIGTERM, _cleanup_handler)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, _cleanup_handler)
+    except Exception:
+        pass
+
+    # Iniciar watchdog de desconexión si se cierran todas las ventanas del navegador
+    start_watchdog(bridge)
+
     # Auto-connect on startup to the last used Bluetooth device (or the first available one)
     try:
         st = bridge.send_command({"action": "state"})
