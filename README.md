@@ -36,7 +36,7 @@ Un mini-reproductor de escritorio moderno, ligero y universal para Windows 10/11
 
 1. **Clona este repositorio:**
    ```bash
-   git clone https://github.com/<tu-usuario>/bt-miniplayer.git
+   git clone https://github.com/Dazhol/bt-miniplayer.git
    cd bt-miniplayer
    ```
 
